@@ -30,7 +30,7 @@ By using this project, you agree **never** to employ it for any of the following
 - **No misleading attribution** – You may not imply that authors or contributors endorse or participate in your activities.
 
 ## 4. Reporting Violations
-If you believe this project is being used for any prohibited purpose, or if you have questions about lawful use, please report to: **[insert email address or private GitHub security advisory link]**. All reports will be treated seriously and kept confidential.
+If you believe this project is being used for any prohibited purpose, or if you have questions about lawful use, please report it. All reports will be treated seriously and kept confidential.
 
 ## 5. Changes to This Statement
 This ethics statement may be updated from time to time. Continued use of the project after changes constitutes acceptance of the revised terms.
