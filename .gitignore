@@ -31,3 +31,15 @@ node_modules/
 # Logs
 *.log
 *.tmp
+
+# Secrets / credentials
+.env
+.env.*
+*.key
+*.pem
+credentials*
+secrets*
+*_secret*
+id_rsa*
+.netrc
+
