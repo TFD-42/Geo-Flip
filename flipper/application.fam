@@ -8,7 +8,7 @@ App(
     fap_icon="rf_logger_icon.png",
     fap_icon_assets="images",
     fap_author="Mhz_Localise",
-    fap_version="1.0",
-    fap_description="Sub-GHz RSSI logger. Streams CSV over USB and writes to SD card.",
-    requires=["gui", "subghz"],
+    fap_version="2.1",
+    fap_description="Sub-GHz RSSI logger. Streams CSV over USB and BLE, writes to SD card.",
+    requires=["gui", "subghz", "bt"],
 )

@@ -14,9 +14,9 @@ We aim to acknowledge reports within 7 days and provide a fix or mitigation time
 
 In scope:
 
-- The Flipper FAP (`Build/rf_logger/`) — memory safety, SD-card path handling.
-- The Android Capacitor plugin (`Build/android_app/plugin/`) — USB intent handling, line parsing, permission flow.
-- The web UI (`Build/android_app/www/`) — file import parser, exported data integrity.
+- The Flipper FAP (`flipper/`) — memory safety, SD-card path handling, BLE/USB stream handling.
+- The Android Capacitor plugins (`android/plugin/`) — USB intent handling, BLE GATT/pairing flow, line parsing, permission flow.
+- The web UI (`android/www/`) — file import parser, exported data integrity.
 
 Out of scope:
 

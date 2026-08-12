@@ -1,0 +1,67 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  # spectrum_scraper is pure Python standard library — compile-check it and
+  # confirm the bundled allocation CSV parses with the expected columns.
+  python:
+    name: Python (spectrum_scraper)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - name: Byte-compile scraper
+        run: python -m py_compile spectrum_scraper/*.py
+      - name: Validate spectrum.csv header + rows
+        run: |
+          python - <<'PY'
+          import csv, sys
+          path = "android/www/spectrum.csv"
+          with open(path, newline="", encoding="utf-8") as f:
+              r = csv.DictReader(f)
+              required = {"freq_low_mhz", "freq_high_mhz"}
+              missing = required - set(r.fieldnames or [])
+              assert not missing, f"spectrum.csv missing columns: {missing}"
+              n = 0
+              for row in r:
+                  float(row["freq_low_mhz"]); float(row["freq_high_mhz"])
+                  n += 1
+          assert n > 0, "spectrum.csv has no data rows"
+          print(f"spectrum.csv OK: {n} rows, columns={r.fieldnames}")
+          PY
+
+  # Web UI is vanilla JS (no build step) — syntax-check the sources.
+  web:
+    name: Web UI (syntax)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+      - name: Syntax-check JS
+        run: node --check android/www/app.js
+
+  # Build the Flipper FAP exactly as a maintainer would, with ufbt.
+  fap:
+    name: Flipper FAP (ufbt build)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - name: Install ufbt
+        run: pip install ufbt
+      - name: Fetch Flipper SDK
+        run: ufbt update
+      - name: Build FAP
+        working-directory: flipper
+        run: ufbt

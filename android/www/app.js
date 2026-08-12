@@ -1,10 +1,11 @@
 /*
  * RF Triangulator — front-end logic
  * ---------------------------------
- * Listens to the FlipperSerial Capacitor plugin for live CSV rows,
- * mirrors freq + RSSI in the top bar, lets the user capture {lat,lon,rssi,freq}
- * tuples via GPS, draws them on a Leaflet map, and runs a Nelder-Mead
- * least-squares solver to estimate the transmitter location.
+ * Listens to the FlipperSerial (USB) or FlipperBle (Bluetooth) Capacitor
+ * plugin for live CSV rows, mirrors freq + RSSI in the top bar, lets the
+ * user capture {lat,lon,rssi,freq} tuples via GPS, draws them on a Leaflet
+ * map, and runs a Nelder-Mead least-squares solver to estimate the
+ * transmitter location. Sessions persist to localStorage.
  *
  * The path-loss distance model is:
  *     d = 10^( (Tx_dBm - RSSI_dBm) / (10 * n) )
@@ -17,16 +18,57 @@
 /* ----------------------------- state ----------------------------- */
 const state = {
   connected: false,
+  transport: 'usb', // 'usb' | 'ble'
+  bleAddr: null,    // remembered BLE device address (picker choice)
   freqHz: null,
-  rssi: null,
-  captures: [],     // {id, lat, lon, rssi, freq, source}
-  estimate: null,   // {lat, lon, rms}
+  rssi: null,        // last raw sample
+  rssiSmooth: null,  // EMA-filtered value used for display + captures
+  lastSampleAt: 0,
+  captures: [],     // {id, lat, lon, rssi, freq, source, outlier?}
+  estimate: null,   // {lat, lon, rms, excluded}
   autoTimer: null,
   autoInterval: 2000,
   n: 3.0,
   txDbm: 10,
+  autoExclude: true,
   nextId: 1,
 };
+
+/* ----------------------------- persistence ----------------------------- */
+const STORE_KEY = 'rft_session_v1';
+
+function saveSession() {
+  try {
+    localStorage.setItem(STORE_KEY, JSON.stringify({
+      captures: state.captures,
+      nextId: state.nextId,
+      n: state.n,
+      txDbm: state.txDbm,
+      autoExclude: state.autoExclude,
+      transport: state.transport,
+      bleAddr: state.bleAddr,
+    }));
+  } catch (e) { /* quota/unavailable — session stays in memory only */ }
+}
+
+function loadSession() {
+  try {
+    const raw = localStorage.getItem(STORE_KEY);
+    if (!raw) return;
+    const s = JSON.parse(raw);
+    if (Array.isArray(s.captures)) {
+      state.captures = s.captures.filter(c =>
+        isFinite(c.lat) && isFinite(c.lon) && isFinite(c.rssi));
+    }
+    const maxId = state.captures.reduce((m, c) => Math.max(m, c.id || 0), 0);
+    state.nextId = Math.max(s.nextId || 1, maxId + 1);
+    if (isFinite(s.n) && s.n >= 1.5 && s.n <= 6) state.n = s.n;
+    if (isFinite(s.txDbm)) state.txDbm = s.txDbm;
+    if (typeof s.autoExclude === 'boolean') state.autoExclude = s.autoExclude;
+    if (s.transport === 'usb' || s.transport === 'ble') state.transport = s.transport;
+    if (typeof s.bleAddr === 'string' && s.bleAddr) state.bleAddr = s.bleAddr;
+  } catch (e) { /* corrupt store — start fresh */ }
+}
 
 /* ----------------------------- map ----------------------------- */
 const map = L.map('map', { zoomControl: true }).setView([48.8566, 2.3522], 14);
@@ -53,7 +95,14 @@ navigator.geolocation.watchPosition(pos => {
 }, err => console.warn('geo', err), { enableHighAccuracy: true, maximumAge: 1000 });
 
 /* ----------------------------- bridge ----------------------------- */
-const Bridge = window.Capacitor?.Plugins?.FlipperSerial;
+/* Two native transports expose the same {connect, disconnect} methods and
+ * the same 'data' / 'status' event shapes, so everything downstream of
+ * handleSerialLine is transport-agnostic. */
+const Bridges = {
+  usb: window.Capacitor?.Plugins?.FlipperSerial,
+  ble: window.Capacitor?.Plugins?.FlipperBle,
+};
+function activeBridge() { return Bridges[state.transport]; }
 
 function setConnDot(on) {
   state.connected = on;
@@ -63,14 +112,19 @@ function setConnDot(on) {
   dot.title = on ? 'connected' : 'disconnected';
 }
 
-if (Bridge) {
-  Bridge.addListener('status', ev => {
+for (const [name, bridge] of Object.entries(Bridges)) {
+  if (!bridge) continue;
+  bridge.addListener('status', ev => {
+    if (name !== state.transport) return;
     setConnDot(ev.state === 'connected');
   });
-  Bridge.addListener('data', ev => {
+  bridge.addListener('data', ev => {
+    if (name !== state.transport) return;
     handleSerialLine(ev.line);
   });
 }
+
+const SMOOTH_ALPHA = 0.3; // EMA at 5 Hz → ~0.6 s time constant
 
 function handleSerialLine(line) {
   if (!line || line.startsWith('#') || line.startsWith('ts_ms')) return;
@@ -80,7 +134,15 @@ function handleSerialLine(line) {
   const reqHz   = parseInt(parts[1], 10);
   const rssi    = parseInt(parts[3], 10);
   if (!isFinite(rssi)) return;
-  state.rssi   = rssi;
+  const now = Date.now();
+  // A retune or a stream gap makes the old average meaningless — reset it
+  if (isFinite(reqHz) && reqHz !== state.freqHz) state.rssiSmooth = null;
+  if (now - state.lastSampleAt > 2000) state.rssiSmooth = null;
+  state.lastSampleAt = now;
+  state.rssi = rssi;
+  state.rssiSmooth = state.rssiSmooth === null
+    ? rssi
+    : SMOOTH_ALPHA * rssi + (1 - SMOOTH_ALPHA) * state.rssiSmooth;
   if (isFinite(reqHz)) state.freqHz = reqHz;
   renderReadout();
   // Auto-sync allocation list with live frequency
@@ -93,36 +155,48 @@ function renderReadout() {
   fEl.textContent = state.freqHz
     ? (state.freqHz / 1e6).toFixed(2) + ' MHz'
     : '— MHz';
-  rEl.textContent = state.rssi !== null ? state.rssi + ' dBm' : '— dBm';
-  const fill = Math.max(0, Math.min(100, ((state.rssi ?? -120) + 120) / 90 * 100));
+  const shown = state.rssiSmooth ?? state.rssi;
+  rEl.textContent = shown !== null ? shown.toFixed(1) + ' dBm' : '— dBm';
+  const fill = Math.max(0, Math.min(100, ((shown ?? -120) + 120) / 90 * 100));
   document.getElementById('barFill').style.width = fill + '%';
 }
 
 /* ----------------------------- capture ----------------------------- */
 function capture(source = 'manual') {
-  if (state.rssi === null) { toast('No live RSSI yet'); return; }
+  const rssi = state.rssiSmooth ?? state.rssi;
+  if (rssi === null) { toast('No live RSSI yet'); return; }
   navigator.geolocation.getCurrentPosition(pos => {
     const c = {
       id: state.nextId++,
       lat: pos.coords.latitude,
       lon: pos.coords.longitude,
-      rssi: state.rssi,
+      rssi: Math.round(rssi * 10) / 10,
       freq: state.freqHz,
       source,
     };
     state.captures.push(c);
-    drawCapture(c);
-    renderCaptureList();
     solve();
   }, err => toast('GPS error: ' + err.message), { enableHighAccuracy: true, maximumAge: 0, timeout: 8000 });
 }
 
 function drawCapture(c) {
-  const m = L.marker([c.lat, c.lon]).addTo(layerCaptures)
+  if (c.outlier) {
+    L.circleMarker([c.lat, c.lon], {
+      radius: 7, color: '#f85149', fillColor: '#f85149', fillOpacity: 0.4,
+    }).addTo(layerCaptures).bindPopup(`#${c.id} ${c.rssi} dBm — excluded (multipath?)`);
+    return; // no distance circle: its radius is what the solver rejected
+  }
+  L.marker([c.lat, c.lon]).addTo(layerCaptures)
     .bindPopup(`#${c.id} ${c.rssi} dBm`);
   const d = rssiToDistance(c.rssi);
   L.circle([c.lat, c.lon], { radius: d, color: '#888', weight: 1, fillOpacity: 0.05 })
     .addTo(layerCircles);
+}
+
+function redrawAll() {
+  layerCaptures.clearLayers();
+  layerCircles.clearLayers();
+  for (const c of state.captures) drawCapture(c);
 }
 
 function renderCaptureList() {
@@ -130,7 +204,13 @@ function renderCaptureList() {
   ol.innerHTML = '';
   for (const c of state.captures) {
     const li = document.createElement('li');
-    li.textContent = `${c.rssi} dBm — ${c.lat.toFixed(5)}, ${c.lon.toFixed(5)} (${rssiToDistance(c.rssi).toFixed(0)} m)`;
+    const base = `${c.rssi} dBm — ${c.lat.toFixed(5)}, ${c.lon.toFixed(5)} (${rssiToDistance(c.rssi).toFixed(0)} m)`;
+    if (c.outlier) {
+      li.className = 'outlier';
+      li.textContent = '⚠ ' + base + ' — excluded';
+    } else {
+      li.textContent = base;
+    }
     ol.appendChild(li);
   }
   document.getElementById('estN').textContent = state.captures.length;
@@ -153,9 +233,9 @@ function haversine(lat1, lon1, lat2, lon2) {
   return 2 * R_EARTH * Math.asin(Math.sqrt(a));
 }
 
-function residualSum([lat, lon]) {
+function residualSum([lat, lon], caps) {
   let s = 0;
-  for (const c of state.captures) {
+  for (const c of caps) {
     const d_obs = rssiToDistance(c.rssi);
     const d_est = haversine(lat, lon, c.lat, c.lon);
     const r = d_est - d_obs;
@@ -211,35 +291,140 @@ function nelderMead(f, x0, opts = {}) {
   return simplex[0];
 }
 
-function solve() {
-  if (state.captures.length < 3) {
-    state.estimate = null;
-    document.getElementById('estLat').textContent = '—';
-    document.getElementById('estLon').textContent = '—';
-    document.getElementById('estRms').textContent = '—';
-    if (estimateMarker) { map.removeLayer(estimateMarker); estimateMarker = null; }
-    return;
-  }
+function runSolver(caps) {
   /* weighted centroid as starting guess */
   let wsum = 0, lat0 = 0, lon0 = 0;
-  for (const c of state.captures) {
+  for (const c of caps) {
     const w = Math.pow(10, c.rssi / 10); /* stronger = higher weight */
     wsum += w; lat0 += w * c.lat; lon0 += w * c.lon;
   }
   lat0 /= wsum; lon0 /= wsum;
+  return nelderMead(p => residualSum(p, caps), [lat0, lon0], { step: 1e-3 });
+}
 
-  const sol = nelderMead(residualSum, [lat0, lon0], { step: 1e-3 });
-  const rms = Math.sqrt(sol.v / state.captures.length);
-  state.estimate = { lat: sol.p[0], lon: sol.p[1], rms };
+/* Leave-one-out outlier rejection. A residual-vs-RMS test fails here
+ * because a gross multipath outlier inflates the very RMS it is judged
+ * against (masking). Instead: re-solve without each capture in turn; if
+ * dropping one collapses the RMS, that capture was poisoning the fit.
+ * Repeats until no removal helps, the fit is already tight (<= 25 m), or
+ * only 3 captures remain. */
+const OUTLIER_IMPROVE_RATIO = 0.5;
+const OUTLIER_FLOOR_M = 25;
 
-  document.getElementById('estLat').textContent = sol.p[0].toFixed(6);
-  document.getElementById('estLon').textContent = sol.p[1].toFixed(6);
-  document.getElementById('estRms').textContent = rms.toFixed(1);
+function rejectOutliers(caps) {
+  let kept = caps.slice();
+  let sol = runSolver(kept);
+  while (state.autoExclude && kept.length - 1 >= 3) {
+    const rms = Math.sqrt(sol.v / kept.length);
+    if (rms <= OUTLIER_FLOOR_M) break;
+    let best = null;
+    for (let i = 0; i < kept.length; i++) {
+      const subset = kept.filter((_, j) => j !== i);
+      const s = runSolver(subset);
+      const r = Math.sqrt(s.v / subset.length);
+      if (!best || r < best.rms) best = { i, sol: s, rms: r };
+    }
+    if (best.rms >= OUTLIER_IMPROVE_RATIO * rms) break;
+    kept[best.i].outlier = true;
+    kept = kept.filter((_, j) => j !== best.i);
+    sol = best.sol;
+  }
+  return { sol, kept };
+}
 
-  if (estimateMarker) map.removeLayer(estimateMarker);
-  estimateMarker = L.marker([sol.p[0], sol.p[1]], {
-    title: 'Estimated Tx',
-  }).addTo(map).bindPopup(`Estimated Tx<br>RMS: ${rms.toFixed(1)} m`).openPopup();
+function solve() {
+  const caps = state.captures;
+  caps.forEach(c => { delete c.outlier; });
+  let est = null;
+
+  if (caps.length >= 3) {
+    const { sol, kept } = rejectOutliers(caps);
+    est = {
+      lat: sol.p[0], lon: sol.p[1],
+      rms: Math.sqrt(sol.v / kept.length),
+      excluded: caps.length - kept.length,
+    };
+  }
+
+  state.estimate = est;
+  renderEstimate();
+  redrawAll();
+  renderCaptureList();
+  renderGeometry();
+  saveSession();
+}
+
+function renderEstimate() {
+  const est = state.estimate;
+  const hadMarker = estimateMarker !== null;
+  if (estimateMarker) { map.removeLayer(estimateMarker); estimateMarker = null; }
+  if (!est) {
+    document.getElementById('estLat').textContent = '—';
+    document.getElementById('estLon').textContent = '—';
+    document.getElementById('estRms').textContent = '—';
+    document.getElementById('estExcl').textContent = '0';
+    return;
+  }
+  document.getElementById('estLat').textContent = est.lat.toFixed(6);
+  document.getElementById('estLon').textContent = est.lon.toFixed(6);
+  document.getElementById('estRms').textContent = est.rms.toFixed(1);
+  document.getElementById('estExcl').textContent = est.excluded;
+  estimateMarker = L.marker([est.lat, est.lon], { title: 'Estimated Tx' })
+    .addTo(map).bindPopup(`Estimated Tx<br>RMS: ${est.rms.toFixed(1)} m`);
+  if (!hadMarker) estimateMarker.openPopup();
+}
+
+/* ----------------------------- capture geometry ----------------------------- */
+/* Two failure modes are checked:
+ *  1. Collinearity (PCA aspect ratio of the point cloud in meters) — a line
+ *     of captures gives a mirror-ambiguous fix. Angular coverage alone
+ *     misses this: points north and south of the line's own centroid look
+ *     like they surround it.
+ *  2. Angular coverage around the centroid — captures bunched on one side
+ *     of the source give an ambiguous fix even with a low RMS. */
+function geometryInfo() {
+  const caps = state.captures.filter(c => !c.outlier);
+  if (caps.length < 3) return null;
+  let lat0 = 0, lon0 = 0;
+  for (const c of caps) { lat0 += c.lat; lon0 += c.lon; }
+  lat0 /= caps.length; lon0 /= caps.length;
+
+  const mPerLat = 110540, mPerLon = 111320 * Math.cos(toRad(lat0));
+  let sxx = 0, syy = 0, sxy = 0;
+  for (const c of caps) {
+    const x = (c.lon - lon0) * mPerLon;
+    const y = (c.lat - lat0) * mPerLat;
+    sxx += x * x; syy += y * y; sxy += x * y;
+  }
+  const tr = sxx + syy, det = sxx * syy - sxy * sxy;
+  const disc = Math.sqrt(Math.max(0, tr * tr / 4 - det));
+  const lMax = tr / 2 + disc, lMin = tr / 2 - disc;
+  const aspect = lMax > 0 ? Math.sqrt(Math.max(0, lMin) / lMax) : 0;
+  if (aspect < 0.25) return { label: 'poor — captures form a line', cls: 'geom-poor' };
+
+  /* Coverage is judged around the estimated Tx when available: captures all
+   * on one side of the SOURCE always surround their own centroid, so the
+   * centroid is only a fallback. */
+  const ref = state.estimate ?? { lat: lat0, lon: lon0 };
+  const bearings = caps.map(c =>
+    (Math.atan2((c.lon - ref.lon) * Math.cos(toRad(lat0)), c.lat - ref.lat) * 180 / Math.PI + 360) % 360
+  ).sort((a, b) => a - b);
+  let maxGap = 0;
+  for (let i = 0; i < bearings.length; i++) {
+    const next = i + 1 < bearings.length ? bearings[i + 1] : bearings[0] + 360;
+    maxGap = Math.max(maxGap, next - bearings[i]);
+  }
+  const coverage = 360 - maxGap;
+  if (coverage >= 180) return { label: 'good',                       cls: 'geom-good' };
+  if (coverage >= 100) return { label: 'fair — spread out more',     cls: 'geom-fair' };
+  return                      { label: 'poor — surround the source', cls: 'geom-poor' };
+}
+
+function renderGeometry() {
+  const el = document.getElementById('estGeom');
+  const g = geometryInfo();
+  el.className = g ? g.cls : '';
+  el.textContent = g ? g.label : '—';
 }
 
 /* ----------------------------- file import ----------------------------- */
@@ -330,12 +515,122 @@ document.getElementById('autoBtn').onclick = () => {
   }
 };
 document.getElementById('connectBtn').onclick = async () => {
-  if (!Bridge) { toast('Native bridge unavailable'); return; }
-  try { await Bridge.connect(); } catch (e) { toast('Connect failed: ' + e); }
+  const bridge = activeBridge();
+  if (!bridge) { toast('Native bridge unavailable'); return; }
+  if (state.transport === 'ble') { await bleConnect(bridge); return; }
+  try { await bridge.connect(); } catch (e) { toast('Connect failed: ' + e); }
 };
+
+/* BLE connect: remembered device first, then auto-match, then manual picker.
+ * Custom-named Flippers (e.g. "MyFlipper") don't advertise the "Flipper"
+ * prefix, so auto-match can fail — the picker covers that case once and
+ * the choice is remembered for every later session. */
+async function bleConnect(bridge) {
+  if (state.bleAddr) {
+    try { await bridge.connect({ address: state.bleAddr }); return; }
+    catch (e) { toast('Saved Flipper unreachable, rescanning…'); }
+  }
+  try { await bridge.connect(); return; }
+  catch (e) {
+    const msg = String(e.message || e);
+    if (!/No Flipper found/i.test(msg)) { toast('Connect failed: ' + msg); return; }
+  }
+  let devices = [];
+  try {
+    toast('Scanning nearby devices…');
+    devices = (await bridge.scan()).devices || [];
+  } catch (e) { toast('Scan failed: ' + e); return; }
+  if (!devices.length) {
+    toast('No BLE devices at all. On the Flipper check RF Logger shows BT:adv, and close the official Flipper app (it hijacks the link).');
+    return;
+  }
+  showBlePicker(bridge, devices);
+}
+
+function showBlePicker(bridge, devices) {
+  const old = document.getElementById('blePicker');
+  if (old) old.remove();
+  devices.sort((a, b) => (b.likelyFlipper - a.likelyFlipper) || (b.rssi - a.rssi));
+  const wrap = document.createElement('div');
+  wrap.id = 'blePicker';
+  wrap.style.cssText = 'position:fixed;inset:0;background:rgba(0,0,0,.75);z-index:2000;display:flex;align-items:center;justify-content:center;';
+  const box = document.createElement('div');
+  box.style.cssText = 'background:#161b22;border:1px solid #30363d;border-radius:10px;max-width:88vw;max-height:70vh;overflow:auto;padding:14px;min-width:260px;';
+  box.innerHTML = '<h3 style="margin:0 0 4px;color:#e6edf3;font-size:15px;">Pick your Flipper</h3>' +
+    '<p style="margin:0 0 10px;color:#7d8590;font-size:12px;">Its name is the one on the Flipper\'s screen (custom names have no "Flipper" prefix).</p>';
+  for (const d of devices) {
+    const b = document.createElement('button');
+    b.style.cssText = 'display:block;width:100%;text-align:left;margin:4px 0;padding:10px;background:#21262d;color:#e6edf3;border:1px solid #30363d;border-radius:8px;font-size:14px;';
+    if (d.likelyFlipper) b.style.borderColor = '#2ea043';
+    b.innerHTML = `<b>${d.name || '(no name)'}</b>` +
+      `<span style="float:right;color:#7d8590;">${d.rssi} dBm</span>` +
+      `<br><small style="color:#7d8590;">${d.address}${d.likelyFlipper ? ' · likely Flipper' : ''}</small>`;
+    b.onclick = async () => {
+      wrap.remove();
+      toast('Connecting to ' + (d.name || d.address) + '…');
+      try {
+        await bridge.connect({ address: d.address });
+        state.bleAddr = d.address;
+        saveSession();
+      } catch (e) { toast('Connect failed: ' + (e.message || e)); }
+    };
+    box.appendChild(b);
+  }
+  const cancel = document.createElement('button');
+  cancel.textContent = 'Cancel';
+  cancel.style.cssText = 'display:block;width:100%;margin-top:10px;padding:10px;background:transparent;color:#7d8590;border:1px solid #30363d;border-radius:8px;';
+  cancel.onclick = () => wrap.remove();
+  box.appendChild(cancel);
+  wrap.appendChild(box);
+  document.body.appendChild(wrap);
+}
 document.getElementById('disconnectBtn').onclick = async () => {
-  if (Bridge) await Bridge.disconnect();
+  const bridge = activeBridge();
+  if (bridge) await bridge.disconnect();
 };
+
+const transportSel = document.getElementById('transportSel');
+transportSel.onchange = async () => {
+  const prev = Bridges[state.transport];
+  if (prev && state.connected) { try { await prev.disconnect(); } catch (e) {} }
+  setConnDot(false);
+  state.transport = transportSel.value;
+  saveSession();
+};
+
+/* ---- solver settings ---- */
+const ENV_PRESETS = { open: 2.0, suburban: 2.7, urban: 3.0, dense: 3.5, indoor: 4.5 };
+const envSel     = document.getElementById('envSel');
+const nInput     = document.getElementById('nInput');
+const txInput    = document.getElementById('txInput');
+const outlierChk = document.getElementById('outlierChk');
+
+envSel.onchange = () => {
+  const n = ENV_PRESETS[envSel.value];
+  if (n === undefined) return; // "custom" — keep current value
+  state.n = n;
+  nInput.value = n;
+  solve();
+};
+nInput.onchange = () => {
+  const v = parseFloat(nInput.value);
+  if (!isFinite(v) || v < 1.5 || v > 6) { nInput.value = state.n; return; }
+  state.n = v;
+  const preset = Object.entries(ENV_PRESETS).find(([, pv]) => pv === v);
+  envSel.value = preset ? preset[0] : 'custom';
+  solve();
+};
+txInput.onchange = () => {
+  const v = parseFloat(txInput.value);
+  if (!isFinite(v)) { txInput.value = state.txDbm; return; }
+  state.txDbm = v;
+  solve();
+};
+outlierChk.onchange = () => {
+  state.autoExclude = outlierChk.checked;
+  solve();
+};
+
 document.getElementById('loadBtn').onclick = () => document.getElementById('fileInput').click();
 document.getElementById('fileInput').onchange = e => {
   const file = e.target.files[0]; if (!file) return;
@@ -343,8 +638,8 @@ document.getElementById('fileInput').onchange = e => {
   r.onload = () => {
     const imported = parseImported(r.result);
     if (!imported.length) { toast('Nothing parseable in file'); return; }
-    for (const c of imported) { state.captures.push(c); drawCapture(c); }
-    renderCaptureList(); solve();
+    for (const c of imported) state.captures.push(c);
+    solve();
     toast(`Imported ${imported.length} captures`);
   };
   r.readAsText(file);
@@ -352,13 +647,25 @@ document.getElementById('fileInput').onchange = e => {
 document.getElementById('exportCsvBtn').onclick  = exportCsv;
 document.getElementById('exportJsonBtn').onclick = exportJson;
 document.getElementById('clearBtn').onclick = () => {
-  state.captures = []; state.estimate = null;
-  layerCaptures.clearLayers(); layerCircles.clearLayers();
-  if (estimateMarker) { map.removeLayer(estimateMarker); estimateMarker = null; }
-  renderCaptureList(); solve();
+  state.captures = [];
+  solve();
 };
+
+/* ---- boot: restore last session, reflect settings into inputs ---- */
+loadSession();
+nInput.value  = state.n;
+txInput.value = state.txDbm;
+outlierChk.checked = state.autoExclude;
+{
+  const preset = Object.entries(ENV_PRESETS).find(([, pv]) => pv === state.n);
+  envSel.value = preset ? preset[0] : 'custom';
+}
+transportSel.value = state.transport;
 renderReadout();
-renderCaptureList();
+solve();
+if (state.captures.length) {
+  map.fitBounds(L.latLngBounds(state.captures.map(c => [c.lat, c.lon])).pad(0.3));
+}
 })();
 
 /* ===================================================================== */
@@ -644,23 +951,15 @@ renderCaptureList();
   function hideEmpty() { $('allocEmpty').classList.add('hidden'); }
 
   /* ---- Live sync from Flipper stream --------------------------------- */
+  /* Keep the allocation table in step with the live frequency, but NEVER
+   * force a tab switch: the stream arrives at 5 Hz, so auto-activating the
+   * allocation tab trapped the user there — every packet yanked them back
+   * off the Triangulator. The table is updated in place so it's already
+   * current whenever the user chooses to open the Allocation tab. */
   window.syncAllocByFreq = function(freqHz) {
-    if (allocations.length === 0) return; // Not loaded yet
+    if (allocations.length === 0) return; // not loaded until the tab is first opened
     const freqMhz = freqHz / 1e6;
     const matches = allocations.filter((a) => a.freq_low_mhz <= freqMhz && freqMhz <= a.freq_high_mhz);
-    // Auto-switch to allocation tab and display matches
-    const allocTabBtn = $$('#tabs .tab').find(btn => btn.dataset.tab === 'alloc');
-    const mapTabBtn = $$('#tabs .tab').find(btn => btn.dataset.tab === 'map');
-    if (allocTabBtn && mapTabBtn && !allocTabBtn.classList.contains('active')) {
-      // Only auto-switch if currently on map tab
-      allocTabBtn.classList.add('active');
-      mapTabBtn.classList.remove('active');
-      tabPanels.alloc.classList.add('active');
-      tabPanels.map.classList.remove('active');
-      if (typeof map !== 'undefined' && map.invalidateSize) {
-        setTimeout(() => map.invalidateSize(), 50);
-      }
-    }
     renderTable(matches);
   };
 })();

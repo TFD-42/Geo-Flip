@@ -81,6 +81,54 @@ VID 0x0483    PID 0x5740
 ```
 Permissions are requested at runtime via a `BroadcastReceiver`. No additional Android manifest entry is required beyond the standard Capacitor USB-host feature.
 
+### BLE support (FlipperBlePlugin)
+
+`android/plugin/FlipperBlePlugin.java` adds a Bluetooth Low Energy transport
+alongside USB. It exposes the same JS API and event shapes as
+`FlipperSerialPlugin`, so the web UI switches between them with a drawer
+setting (Transport: USB cable / Bluetooth).
+
+Build wiring (in addition to the steps above):
+
+```java
+// MainActivity.java
+registerPlugin(FlipperBlePlugin.class);
+```
+
+```xml
+<!-- AndroidManifest.xml -->
+<uses-permission android:name="android.permission.BLUETOOTH_SCAN"
+                 android:usesPermissionFlags="neverForLocation" />
+<uses-permission android:name="android.permission.BLUETOOTH_CONNECT" />
+<!-- pre-Android-12 BLE -->
+<uses-permission android:name="android.permission.BLUETOOTH" android:maxSdkVersion="30" />
+<uses-permission android:name="android.permission.BLUETOOTH_ADMIN" android:maxSdkVersion="30" />
+<uses-permission android:name="android.permission.ACCESS_FINE_LOCATION" android:maxSdkVersion="30" />
+```
+
+No extra Gradle dependency — the plugin uses only `android.bluetooth`
+framework APIs.
+
+Runtime notes:
+- Bluetooth must be enabled on the Flipper (**Settings → Bluetooth**).
+- The Flipper's BLE Serial characteristics are encrypted; the first connect
+  triggers Android's system pairing dialog. The plugin retries notification
+  setup automatically once bonding completes.
+- `connect()` with no arguments scans ~4 s and picks the strongest device
+  advertising a `Flipper*` name; `connect({address})` targets a specific one.
+- Auto-reconnect retries every 2 s after a link drop, matching the USB
+  plugin's behavior.
+
+**Current limitation — firmware side pending:** with stock firmware the BLE
+Serial link carries the Flipper **CLI**, not the `rf_logger` CSV stream.
+`rf_logger.c` currently writes only to USB CDC. Streaming the CSV over BLE
+requires a firmware change (write the same sample lines through the BLE
+serial profile), which must first be validated against the Flipper SDK with
+`ufbt` — the BLE profile APIs available to third-party FAPs are not
+guaranteed stable across firmware versions. Until that lands, the BLE
+transport connects and streams whatever the serial service carries, but
+triangulation data only flows over USB.
+
 ## 3. spectrum_scraper (mhz_allocator)
 
 Pure stdlib — no `pip install` needed.
