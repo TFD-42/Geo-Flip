@@ -1,6 +1,16 @@
 # Mhz_Localiser
 
-**RF signal triangulation + spectrum allocation lookup** — Flipper Zero streams live RSSI over USB to an Android app that logs GPS + signal, estimates the transmitter location on a map, and lets you look up the regulatory allocation (USA, ITU, EU per country) of any frequency you observe.
+[![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
+[![CI](https://github.com/TFD-42/Mhz_Localiser/actions/workflows/ci.yml/badge.svg)](https://github.com/TFD-42/Mhz_Localiser/actions/workflows/ci.yml)
+![Platform: Flipper Zero](https://img.shields.io/badge/platform-Flipper%20Zero-FF8200)
+![Android 8.0+](https://img.shields.io/badge/Android-8.0%2B-3DDC84?logo=android&logoColor=white)
+![Link: USB · BLE](https://img.shields.io/badge/link-USB%20%C2%B7%20BLE-5A29E4?logo=bluetooth&logoColor=white)
+![Spectrum DB: offline](https://img.shields.io/badge/spectrum%20DB-offline-2ea043)
+![Status: beta](https://img.shields.io/badge/status-beta-yellow)
+
+**RF signal triangulation + spectrum allocation lookup** — Flipper Zero streams live RSSI over **USB or Bluetooth LE** to an Android app that logs GPS + signal, estimates the transmitter location on a map, and lets you look up the regulatory allocation (USA, ITU, EU per country) of any frequency you observe.
+
+**Contents:** [How it works](#how-it-works) · [What's new in v2.1](#whats-new-in-v21) · [Operational workflow](#operational-workflow) · [Field validation](#field-validation) · [Physical limitations](#physical-limitations) · [vs. real RF gear](#comparison-with-real-rf-equipment) · [Use cases](#realistic-use-cases) · [Quick start](#quick-start) · [Allocation list](#allocation-list) · [Build from source](#build-from-source) · [Data protocol](#data-protocol-usb--ble)
 
 <img width="1254" height="1254" alt="ChatGPT Image 16 mai 2026 à 03_50_03" src="https://github.com/user-attachments/assets/5aa42b1d-563e-409e-b09f-10ac508359c3" />
 
@@ -24,7 +34,8 @@ Mhz_Localiser/
 │   │   ├── styles.css      mobile-first dark theme
 │   │   └── spectrum.csv    ~2 450 spectrum allocations (offline)
 │   └── plugin/
-│       └── FlipperSerialPlugin.java   Native USB-CDC bridge
+│       ├── FlipperSerialPlugin.java   Native USB-CDC bridge
+│       └── FlipperBlePlugin.java      Native Bluetooth-LE bridge (GATT serial)
 │
 ├── spectrum_scraper/       ← Python tooling that builds spectrum.csv
 │   ├── enrich_spectrum.py  baseline → long-form CSV (EFIS optional)
@@ -36,6 +47,21 @@ Mhz_Localiser/
 ├── SETUP.md                build and install instructions
 └── LICENSE                 MIT
 ```
+
+## What's new in v2.1
+
+| Change | Detail |
+|--------|--------|
+| **Bluetooth LE streaming** | The Flipper now streams the same CSV over **both USB and BLE** simultaneously. Go fully wireless — no cable between Flipper and phone. |
+| **Dual transport picker** | Choose **USB** or **Bluetooth** in the drawer; the solver, map, and allocation lookup are identical on either. |
+| **BLE device picker** | Scans for the Flipper by serial-service UUID and by name; custom-named units (no "Flipper" prefix) are listed and the chosen device is remembered for one-tap reconnect. |
+| **Robust BLE connect** | Forces the LE transport, self-heals advertising, refreshes Android's stale GATT cache, and binds the correct data characteristic (INDICATE) — so it survives re-pairs and firmware re-flashes. |
+| **On-device BT status** | The Flipper running screen shows `BT:off / BT:adv / BT:ok` so you can see the link state at a glance. |
+| **RSSI smoothing** | Exponential moving-average filter on the live stream damps single-sample multipath spikes before capture. |
+| **Selectable environment / path-loss `n`** | Pick open-field / suburban / urban / dense / indoor (or a custom `n`) in the drawer — the single biggest lever on accuracy. |
+| **Automatic outlier rejection** | Leave-one-out residual check flags and excludes likely-multipath captures before the final solve. |
+| **Live capture-geometry hint** | Warns when captures are too collinear (ambiguous fix) so you spread out for better geometry. |
+| **Session persistence** | Captures + settings survive an app restart (stored locally), so a field session isn't lost. |
 
 ## What's new in v2
 
@@ -51,8 +77,8 @@ Mhz_Localiser/
 
 ## How it works
 
-- **Flipper Zero** runs `rf_logger.fap` — a Sub-GHz RSSI logger that continuously samples signal strength on a chosen frequency and streams readings over USB as CSV.
-- **Android app** (`RF_Triangulator.apk`) connects to the Flipper via USB-C, reads the live RSSI stream, and logs GPS + signal captures on a map.
+- **Flipper Zero** runs `rf_logger.fap` — a Sub-GHz RSSI logger that continuously samples signal strength on a chosen frequency and streams readings as CSV over **USB CDC and Bluetooth LE at the same time**.
+- **Android app** (`RF_Triangulator.apk`) connects to the Flipper over **USB-C or Bluetooth LE** (your choice), reads the live RSSI stream, and logs GPS + signal captures on a map.
 - With 3 or more captures from different positions, the app runs a **Nelder-Mead least-squares solver** to estimate the transmitter location.
 
 <img width="3200" height="3200" alt="layout-collage-1779109255380" src="https://github.com/user-attachments/assets/6854f5c0-e2ab-4062-8f6e-4ff474ce8be5" />
@@ -69,17 +95,18 @@ Mhz_Localiser/
 │                                                                 │
 │   CC1101 chip  ──►  RSSI register  ──►  rf_logger.fap          │
 │   (Sub-GHz)        sampled @ 5 Hz      (FAP app)               │
-└────────────────────────────┬────────────────────────────────────┘
-                             │  USB CDC-ACM serial (ch1)
-                             │  115200 baud, dual CDC
-                             │  CSV: ts_ms, req_hz, act_hz,
-                             │       rssi_dbm, rssi_raw, lqi, n
-                             ▼
+└──────────────┬───────────────────────────────┬─────────────────┘
+               │  USB CDC-ACM (ch1)             │  BLE GATT serial
+               │  115200 baud, dual CDC         │  service 0xfe60,
+               │                                │  TX char indicate
+               │  CSV: ts_ms, req_hz, act_hz, rssi_dbm, rssi_raw, lqi, n
+               ▼                                ▼
 ┌─────────────────────────────────────────────────────────────────┐
 │                      Android App                                │
 │                                                                 │
-│  FlipperSerialPlugin  ──►  USB serial reader (Capacitor)        │
-│  (native Java)             parses CSV stream, auto-reconnect    │
+│  FlipperSerialPlugin  ─┐                                        │
+│  FlipperBlePlugin    ─┴►  transport picker (USB / BLE)          │
+│  (native Java)            parses CSV stream, auto-reconnect     │
 │                                                                 │
 │  Geolocation API      ──►  GPS coordinates                      │
 │                                                                 │
@@ -107,10 +134,13 @@ Launch
         Back       — exit app
 
 Running state
-  └─► Live RSSI streamed over USB CSV to Android
+  └─► Live RSSI streamed over USB + BLE CSV to Android
+        Status line shows BT:off / BT:adv / BT:ok
         OK   — toggle SD card logging on/off
         Back — return to frequency entry screen
 ```
+
+> **Bluetooth note:** enable **Settings → Bluetooth** on the Flipper so the app can advertise. Keep the official Flipper mobile app closed while connected here — only one BLE central can hold the link at a time.
 
 ## Operational Workflow
 
@@ -264,13 +294,22 @@ Grant **Location** permission when prompted (required for GPS capture).
 
 ### Step 3 — Connect and capture
 
+Open **RF Triangulator** → tap ☰ and pick your transport:
+
+**USB (wired)**
 1. Plug the Flipper into your Android phone with a USB-C cable.
-2. Open **RF Triangulator** → tap ☰ → **Connect Flipper**.
-3. Accept the USB permission dialog. The app reconnects automatically if USB drops.
-4. The top panel mirrors the Flipper: frequency, RSSI, signal bar.
-5. Walk to a position and tap **Capture here** — the app logs GPS + live RSSI.
-6. Repeat from **3+ different positions** surrounding the suspected transmitter.
-7. The drawer shows the **triangulation estimate** with RMS error once you have 3+ captures.
+2. Transport **USB** → **Connect Flipper** → accept the USB permission dialog. Auto-reconnects if USB drops.
+
+**Bluetooth (wireless)**
+1. On the Flipper: **Settings → Bluetooth ON**, then launch RF Logger (status shows `BT:adv`).
+2. Transport **Bluetooth (BLE)** → **Connect Flipper** → pick your Flipper from the list → accept pairing on both devices. Its address is remembered for one-tap reconnect next time.
+
+Then, on either transport:
+
+3. The top panel mirrors the Flipper: frequency, RSSI, signal bar.
+4. Walk to a position and tap **Capture here** — the app logs GPS + live RSSI.
+5. Repeat from **3+ different positions** surrounding the suspected transmitter.
+6. The drawer shows the **triangulation estimate** with RMS error once you have 3+ captures. Tune the **environment / path-loss `n`** there for your surroundings.
 
 ### Auto-capture mode
 
@@ -328,11 +367,13 @@ cd android
 # Output: app/build/outputs/apk/debug/app-debug.apk
 ```
 
-Stack: **Capacitor** · **usb-serial-for-android** (CDC-ACM) · **Leaflet** (OpenStreetMap)
+Stack: **Capacitor** · **usb-serial-for-android** (CDC-ACM) · **Android BLE** (`BluetoothGatt`, GATT serial) · **Leaflet** (OpenStreetMap)
 
-## USB Serial Protocol
+Both native bridges (`FlipperSerialPlugin.java`, `FlipperBlePlugin.java`) must be registered in `MainActivity` and expose the same `connect`/`disconnect`/`data`/`status` interface, so the web UI treats USB and BLE as interchangeable.
 
-Flipper streams CSV over USB CDC-ACM channel 1 at **115200 baud**:
+## Data Protocol (USB + BLE)
+
+Flipper streams the **same CSV** over USB CDC-ACM channel 1 at **115200 baud** and over **Bluetooth LE** (GATT serial service `0000fe60-…`, data on the TX characteristic `0000fe61-…` via indications). The Android side parses both identically:
 
 ```
 # RF_LOGGER_DBG req=433920000 act=433920000
@@ -351,23 +392,23 @@ ts_ms,req_hz,act_hz,rssi_dbm,rssi_raw,lqi,n
 | `lqi`      | uint8   | Link Quality Indicator |
 | `n`        | uint32  | Sample counter |
 
-Sample rate: **200 ms (5 Hz)**. The Android app auto-detects frequency from `req_hz` — no manual input on the phone side needed.
+Sample rate: **200 ms (5 Hz)**. The Android app auto-detects frequency from `req_hz` — no manual input on the phone side needed. BLE notify packets are reassembled by newline, so line framing is transport-independent.
 
 ## Security
 
 - No API keys, tokens, or credentials in this codebase.
-- No hardcoded IP addresses — all communication is local USB only.
-- USB permission via standard Android intent (`UsbManager.requestPermission`).
-- Location permission requested at runtime only.
+- No hardcoded IP addresses — all communication is local (USB or Bluetooth LE), device-to-phone only.
+- USB permission via standard Android intent (`UsbManager.requestPermission`); Bluetooth via runtime `BLUETOOTH_SCAN`/`BLUETOOTH_CONNECT` permissions (scan flagged `neverForLocation`).
+- Location permission requested at runtime only (for GPS capture).
 - No outbound network requests from the app (map tiles load from OpenStreetMap via WebView only).
 
 ## Requirements
 
 | Component    | Requirement |
 |--------------|-------------|
-| Flipper Zero | Firmware 0.97+ (official or Unleashed) |
-| Android      | 8.0+ (API 26), USB OTG support |
-| USB cable    | USB-C to USB-C (or USB-A OTG adapter) |
+| Flipper Zero | Firmware 0.97+ (official or Unleashed); Bluetooth ON for wireless mode |
+| Android      | 8.0+ (API 26); USB OTG **or** Bluetooth LE |
+| Connection   | USB-C cable (USB-A OTG adapter), **or** Bluetooth LE — no cable needed |
 | GPS          | Required for capture; indoor = poor accuracy |
 
 ## License

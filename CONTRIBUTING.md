@@ -16,9 +16,9 @@ This lets us calibrate the path-loss exponent guidance and document failure mode
 
 ## Code
 
-- **Flipper FAP** (`Build/rf_logger/`) — keep dependencies to `furi`, `furi_hal`, `gui`, `storage`, `notification`. No external libraries.
-- **Android plugin** (`Build/android_app/plugin/`) — `usb-serial-for-android` only. Avoid adding heavyweight deps.
-- **Web UI** (`Build/android_app/www/`) — vanilla JS + Leaflet. No build step, no framework.
+- **Flipper FAP** (`flipper/`) — keep dependencies to `furi`, `furi_hal`, `gui`, `storage`, `notification`, `bt`. No external libraries.
+- **Android plugins** (`android/plugin/`) — `FlipperSerialPlugin` (USB, via `usb-serial-for-android`) and `FlipperBlePlugin` (Bluetooth, via the `android.bluetooth` framework — no extra dep). Both expose the same `connect`/`disconnect`/`data`/`status` interface; keep them interchangeable. Avoid adding heavyweight deps.
+- **Web UI** (`android/www/`) — vanilla JS + Leaflet. No build step, no framework.
 
 Run `clang-format` on C files and stick to 4-space indent / 100-col width.
 

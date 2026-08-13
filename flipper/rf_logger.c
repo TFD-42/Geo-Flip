@@ -3,6 +3,12 @@
  *
  * CSV over USB CDC ch1 (ch0 stays as CLI). Takes over the USB stack with
  * dual-CDC when entering Running state, restores on exit.
+ *
+ * The same CSV lines are also streamed over BLE: at launch the app swaps
+ * the BLE stack to its own Serial profile instance (same GATT service the
+ * stock CLI-over-BLE uses, so phone-side code is identical for both) and
+ * transmits every sample to the connected central. Default profile is
+ * restored on exit. Requires Bluetooth ON in Flipper settings to advertise.
  */
 
 #include <furi.h>
@@ -10,11 +16,14 @@
 #include <furi_hal_subghz.h>
 #include <furi_hal_usb.h>
 #include <furi_hal_usb_cdc.h>
+#include <furi_hal_bt.h>
 #include <gui/gui.h>
 #include <gui/elements.h>
 #include <input/input.h>
 #include <storage/storage.h>
 #include <notification/notification_messages.h>
+#include <bt/bt_service/bt.h>
+#include <profiles/serial_profile.h>
 #include <lib/subghz/devices/cc1101_configs.h>
 
 #define TAG               "rf_logger"
@@ -57,7 +66,65 @@ typedef struct {
     Storage* storage;
     FuriHalUsbInterface* prev_usb;
     bool usb_taken;
+    Bt* bt;
+    FuriHalBleProfileBase* ble_profile;
+    volatile BtStatus bt_status;
+    uint32_t next_adv_kick;
+    uint32_t next_profile_retry;
 } RfLoggerApp;
+
+/* ---- BLE serial streaming ---- */
+
+static void bt_status_cb(BtStatus status, void* ctx) {
+    RfLoggerApp* app = ctx;
+    app->bt_status = status;
+}
+
+static void ble_start(RfLoggerApp* app) {
+    app->bt = furi_record_open(RECORD_BT);
+    bt_disconnect(app->bt);
+    furi_delay_ms(200); // let the stack settle before the profile swap
+    app->ble_profile = bt_profile_start(app->bt, ble_profile_serial, NULL);
+    if(app->ble_profile) {
+        bt_set_status_changed_callback(app->bt, bt_status_cb, app);
+        furi_hal_bt_start_advertising();
+    }
+}
+
+/* Advertising is not fire-and-forget: a settings toggle, key wipe
+ * ("Forget All Paired Devices") or stack restart silently kills it.
+ * Called from the main loop — re-kicks advertising while not connected,
+ * and retries the profile swap if it failed at launch (e.g. BT was off). */
+static void ble_keepalive(RfLoggerApp* app) {
+    uint32_t now = furi_get_tick();
+    if(!app->bt) return;
+    if(!app->ble_profile) {
+        if(now >= app->next_profile_retry) {
+            app->next_profile_retry = now + 10000;
+            app->ble_profile = bt_profile_start(app->bt, ble_profile_serial, NULL);
+            if(app->ble_profile) {
+                bt_set_status_changed_callback(app->bt, bt_status_cb, app);
+                furi_hal_bt_start_advertising();
+            }
+        }
+        return;
+    }
+    if(now >= app->next_adv_kick) {
+        app->next_adv_kick = now + 2000;
+        if(app->bt_status != BtStatusConnected) furi_hal_bt_start_advertising();
+    }
+}
+
+static void ble_stop(RfLoggerApp* app) {
+    if(!app->bt) return;
+    bt_set_status_changed_callback(app->bt, NULL, NULL);
+    bt_disconnect(app->bt);
+    furi_delay_ms(200);
+    bt_profile_restore_default(app->bt);
+    furi_record_close(RECORD_BT);
+    app->bt = NULL;
+    app->ble_profile = NULL;
+}
 
 static void usb_take(RfLoggerApp* app) {
     if(app->usb_taken) return;
@@ -156,6 +223,12 @@ static void sample_once(RfLoggerApp* app) {
                        (unsigned)app->lqi, (unsigned long)app->n);
     if(len > 0) {
         furi_hal_cdc_send(VCP_DATA_CH, (uint8_t*)line, (uint16_t)len);
+        /* Don't gate BLE TX on a cached status enum — that callback proved
+         * unreliable for a custom profile, silently starving the phone.
+         * The serial profile itself returns false when there's no subscriber,
+         * so an unconditional call is safe and self-correcting. */
+        if(app->ble_profile)
+            ble_profile_serial_tx(app->ble_profile, (uint8_t*)line, (uint16_t)len);
         if(app->sd_logging) log_write_line(app, line);
     }
 }
@@ -246,10 +319,13 @@ static void draw_running(Canvas* canvas, RfLoggerApp* app) {
 
     draw_signal_bar(canvas, 4, 44, 120, 8, app->rssi_dbm);
 
-    char info[32];
-    snprintf(info, sizeof(info), "n=%lu lqi=%u %s",
+    const char* bt_s = app->bt_status == BtStatusConnected    ? "BT:ok" :
+                       app->bt_status == BtStatusAdvertising ? "BT:adv" :
+                                                               "BT:off";
+    char info[48];
+    snprintf(info, sizeof(info), "n=%lu lqi=%u %s %s",
              (unsigned long)app->n, (unsigned)app->lqi,
-             app->sd_logging ? "SD:on" : "SD:off");
+             app->sd_logging ? "SD:on" : "SD:off", bt_s);
     canvas_draw_str(canvas, 4, 62, info);
 }
 
@@ -336,6 +412,8 @@ int32_t rf_logger_app(void* p) {
     view_port_input_callback_set(app->viewport, input_cb, app);
     gui_add_view_port(app->gui, app->viewport, GuiLayerFullscreen);
 
+    ble_start(app);
+
     bool exit = false;
     uint32_t next_sample = 0;
     while(!exit) {
@@ -360,12 +438,14 @@ int32_t rf_logger_app(void* p) {
                 next_sample = now + SAMPLE_PERIOD_MS;
             }
         }
+        ble_keepalive(app);
         view_port_update(app->viewport);
     }
 
     subghz_stop();
     log_close(app);
     usb_release(app);
+    ble_stop(app);
     gui_remove_view_port(app->gui, app->viewport);
     view_port_free(app->viewport);
     furi_message_queue_free(app->input_queue);

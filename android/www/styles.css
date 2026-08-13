@@ -62,6 +62,13 @@ main { position: absolute; top: 64px; bottom: 56px; left: 0; right: 0; }
 
 #drawer label { display: flex; justify-content: space-between; align-items: center; gap: 8px; font-size: 13px; margin: 6px 0; }
 #drawer input[type="number"] { width: 80px; background: #0e1116; color: #e6edf3; border: 1px solid #30363d; border-radius: 4px; padding: 4px 8px; }
+#drawer select { background: #0e1116; color: #e6edf3; border: 1px solid #30363d; border-radius: 4px; padding: 6px 8px; font-size: 13px; max-width: 190px; }
+#drawer input[type="checkbox"] { width: 18px; height: 18px; accent-color: #1f6feb; }
+
+#captureList li.outlier { color: #f85149; opacity: 0.8; }
+.geom-good { color: #3fb950; }
+.geom-fair { color: #d29922; }
+.geom-poor { color: #f85149; }
 
 #estimateBox { background: #0e1116; border: 1px solid #30363d; border-radius: 6px; padding: 10px; font-size: 13px; line-height: 1.6; }
 #estimateBox b { font-variant-numeric: tabular-nums; }

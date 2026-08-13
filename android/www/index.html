@@ -97,6 +97,15 @@
     <h2>RF Triangulator</h2>
     <button id="closeDrawer">×</button>
   </div>
+  <h3>Connection</h3>
+  <label class="setting">
+    <span>Transport</span>
+    <select id="transportSel">
+      <option value="usb">USB cable</option>
+      <option value="ble">Bluetooth (BLE)</option>
+    </select>
+  </label>
+
   <ul class="menu">
     <li><button id="connectBtn">Connect Flipper</button></li>
     <li><button id="disconnectBtn">Disconnect</button></li>
@@ -106,9 +115,36 @@
     <li><button id="clearBtn" class="danger">Clear captures</button></li>
   </ul>
 
+  <h3>Solver settings</h3>
+  <label class="setting">
+    <span>Environment</span>
+    <select id="envSel">
+      <option value="open">Open field (n=2.0)</option>
+      <option value="suburban">Suburban (n=2.7)</option>
+      <option value="urban" selected>Urban (n=3.0)</option>
+      <option value="dense">Dense urban (n=3.5)</option>
+      <option value="indoor">Indoor (n=4.5)</option>
+      <option value="custom">Custom</option>
+    </select>
+  </label>
+  <label class="setting">
+    <span>Path-loss n</span>
+    <input id="nInput" type="number" step="0.1" min="1.5" max="6" value="3.0" />
+  </label>
+  <label class="setting">
+    <span>Tx power (dBm)</span>
+    <input id="txInput" type="number" step="1" min="-30" max="30" value="10" />
+  </label>
+  <label class="setting">
+    <span>Auto-exclude outliers</span>
+    <input id="outlierChk" type="checkbox" checked />
+  </label>
+
   <h3>Estimate</h3>
   <div id="estimateBox">
     <div>captures: <b id="estN">0</b></div>
+    <div>excluded: <b id="estExcl">0</b></div>
+    <div>geometry: <b id="estGeom">—</b></div>
     <div>lat: <b id="estLat">—</b></div>
     <div>lon: <b id="estLon">—</b></div>
     <div>rms err: <b id="estRms">—</b> m</div>

@@ -1,0 +1,9 @@
+# Keep GitHub Actions in the CI workflow up to date. (The Flipper FAP and the
+# Android app pull their dependencies from ufbt/Gradle at build time and are
+# not tracked here.)
+version: 2
+updates:
+  - package-ecosystem: "github-actions"
+    directory: "/"
+    schedule:
+      interval: "weekly"
